@@ -1,0 +1,346 @@
+# 라이브러리 설치
+library(tidyverse)
+library(randomForest)
+library(MLmetrics)
+library(caret)
+library(dplyr)
+library(ROCR)
+library(pROC)
+library(plyr)
+
+# 작업환경 설정
+setwd("~/Desktop/YPCL/futures league/")
+
+# Raw Data(AFSNT, AFSNT_DLY) 불러오기
+afsnt <- read.csv("AFSNT.csv", header = TRUE, fileEncoding = 'euc-kr')
+afsnt_dly <- read.csv("AFSNT_DLY.csv", header = TRUE, fileEncoding = 'euc-kr')
+afsnt_dly[3, 5] <- 'ARP1'
+
+# 결항편 삭제하기
+afsnt <- afsnt %>% dplyr::filter(CNL == "N")
+
+# 연, 월, 일 컬럼 범주형으로 변환하기
+afsnt$SDT_YY <- as.factor(afsnt$SDT_YY)
+afsnt$SDT_MM <- as.factor(afsnt$SDT_MM)
+afsnt$SDT_DD <- as.factor(afsnt$SDT_DD)
+
+# 시간 대 별, 각 공항에 예정되어 있는 항공기 편 수 계산
+afsnt$STT <- as.character(afsnt$STT)
+b <- sapply(afsnt[, "STT"],  function(x) {x %>% str_split(pattern = ':')  %>% `[[`(1) })
+HOUR <- b[1, ] %>% as.numeric()
+
+afsnt$HOUR <- HOUR
+afsnt$HOUR <- as.factor(afsnt$HOUR)
+
+afsnt_count <- afsnt %>%
+  dplyr::group_by(SDT_YY, SDT_MM, SDT_DD, ARP, HOUR) %>%
+  dplyr::summarise('count' = n())
+
+afsnt <- left_join(afsnt, afsnt_count, by = c("SDT_YY", "SDT_MM", "SDT_DD", "ARP", "HOUR"))
+
+# 시간 차 계산을 위하여 STT, ATT를 시간 변수로 변환
+afsnt$STT <- strptime(as.character(afsnt$STT), format = "%H:%M")
+afsnt$ATT <- strptime(as.character(afsnt$ATT), format = "%H:%M")
+
+# 시간 차 변수 생성하기
+afsnt$timediff <- difftime(afsnt$ATT, afsnt$STT, units = "mins")
+
+# 시간 차 변수가 음수 인 것(조기 출발)은 0으로 대체
+afsnt <- afsnt[!is.na(afsnt$ATT), ]
+afsnt[(afsnt$timediff) < 0, "timediff"] <- 0
+afsnt$timediff <- as.numeric(afsnt$timediff)
+
+# 모델링을 위하여 시간 변수 삭제
+afsnt <- afsnt[, -c(12:13)]
+
+# 새로운 변수 만들기
+
+# 편명 별 C02비율 변수 생성
+afsnt$DRR.group <- ifelse(afsnt$DRR == "C02",
+                          "C02",
+                          "Non-C02")
+
+afsnt$DRR.group <- as.factor(afsnt$DRR.group)
+
+a <- afsnt %>% 
+  dplyr::group_by(FLT) %>% 
+  dplyr::summarise(n = n())
+b <- afsnt %>% 
+  dplyr::filter(DRR.group == "C02") %>% dplyr::group_by(FLT) %>% dplyr::summarise(n = n())
+c <- as.data.frame(left_join(a, b, by = "FLT"))
+
+c[is.na(c)] <- 0
+
+colnames(c) <- c("FLT", "x", "y")
+c$x <- as.numeric(c$x)
+c$FLT_C02_ratio <-  (c$y/c$x)*100
+colnames(c) <- c("FLT", "x", "y", "FLT_C02_ratio")
+c <- c %>% select(-c(x,y))
+head(c)
+
+# 편명 별 부정기 비율 변수 생성
+a <- afsnt %>% 
+  dplyr::group_by(FLT) %>% 
+  dplyr::summarise(n = n())
+b <- afsnt %>% 
+  dplyr::filter(IRR == "Y") %>% dplyr::group_by(FLT) %>% dplyr::summarise(n = n())
+i <- as.data.frame(left_join(a, b, by = "FLT"))
+
+i[is.na(i)] <- 0
+
+colnames(i) <- c("FLT", "x", "y")
+i$x <- as.numeric(i$x)
+i$FLT.IRR_ratio <-  (i$y/i$x)*100
+colnames(i) <- c("FLT","x","y", "FLT_IRR_ratio")
+i <- i %>% select(-c(x,y))
+head(i)
+
+# 편명별 평균 지연 시간
+f <- afsnt %>% 
+  dplyr::group_by(FLT) %>% 
+  dplyr::summarise(mean(timediff, na.rm = TRUE))
+
+colnames(f) <- c("FLT", "FLT_meantimediff")
+f$FLT_meantimediff <- as.numeric(f$FLT_meantimediff)
+head(f)
+
+# 편명별 지연율
+a <- afsnt %>% 
+  dplyr:::group_by(FLT) %>% 
+  dplyr:::summarise(n = n())
+b <- afsnt %>% dplyr:::filter(DLY == "Y") %>%
+  dplyr:::group_by(FLT) %>% 
+  dplyr:::summarise(n = n())
+g <- as.data.frame(left_join(a, b, by = "FLT"))
+
+g[is.na(g)] <- 0
+
+colnames(g) <- c("FLT", "x", "y")
+g$x <- as.numeric(g$x)
+g$FLT_DLY_ratio <-  (g$y/g$x)*100
+g <- g %>%  select(-c(x,y))
+colnames(g) <- c("FLT","FLT_DLY_ratio")
+
+# 위에 생성한 편명 관련 변수 4개 기존 데이터 셋에 바인딩
+m <- left_join(c, i, by = "FLT")
+m <- left_join(m, f, by = "FLT")
+m <- left_join(m, g, by = "FLT")
+afsnt <- left_join(afsnt, m, by = "FLT")
+
+head(afsnt)
+
+# afsnt_dly 데이터 셋에도 위와 같은 편명 관련 변수 4개 조인
+afsnt_dly$FLT <- as.factor(afsnt_dly$FLT)
+afsnt_dly <- left_join(afsnt_dly, m, by = "FLT")
+afsnt_dly$FLT <- as.factor(afsnt_dly$FLT)
+
+# afsnt_dly 함수에 생성된 변수의 결측치 채우기(중위수 활용)
+FLO_J <- afsnt %>% 
+  dplyr::filter(FLO == "J") %>% 
+  select(20:23) %>% 
+  summarise(mean_FLT_CO2_ratio = median(FLT_C02_ratio),
+            mean_FLT_IRR_ratio = median(FLT_IRR_ratio),
+            mean_FLT_meantimediff = median(FLT_meantimediff),
+            mean_FLT_DLY_ratio = median(FLT_DLY_ratio))
+
+IRR_y <- afsnt %>% 
+  dplyr::filter(IRR == "Y") 
+
+IRR_yy <- IRR_y %>% 
+  select(20:23) %>% 
+  summarise(mean_FLT_CO2_ratio = median(FLT_C02_ratio),
+            mean_FLT_IRR_ratio = 0,
+            mean_FLT_meantimediff = median(FLT_meantimediff),
+            mean_FLT_DLY_ratio = median(FLT_DLY_ratio))
+
+afsnt_dly[afsnt_dly$FLO == "J" & afsnt_dly$FLT_C02_ratio %>% is.na(), c(13:16)] <- FLO_J
+
+afsnt_dly[afsnt_dly$FLO == "M", c(13:16)] <- IRR_yy
+
+# afsnt_dly 데이터, 시간 대 각 공항별 편수 계산
+afsnt_dly$STT <- as.character(afsnt_dly$STT)
+b <- sapply(afsnt_dly[, "STT"],  function(x) {x %>% str_split(pattern = ':')  %>% `[[`(1) })
+HOUR_nd <- b[1, ] %>% as.numeric()
+
+afsnt_dly$HOUR <- HOUR_nd
+afsnt_dly$HOUR <- as.factor(afsnt_dly$HOUR)
+
+afsnt_dly_count <- afsnt_dly %>%
+  dplyr::group_by(SDT_YY, SDT_MM, SDT_DD, ARP, HOUR) %>%
+  dplyr::summarise('count' = n())
+
+afsnt_dly <- left_join(afsnt_dly, afsnt_dly_count, by = c("SDT_YY", "SDT_MM", "SDT_DD", "ARP", "HOUR"))
+
+head(afsnt_dly)
+
+# 학습 셋과 시험 셋(미지연 지연 비율 조정) 적합하기
+# 사용할 변수만 남기기
+afsnt <- afsnt[ , -c(6,8,9,11,13,14,15,18,19)]
+
+# 범주형 컬럼 지정
+afsnt_dly$SDT_YY <- as.factor(afsnt_dly$SDT_YY)
+afsnt_dly$SDT_MM <- as.factor(afsnt_dly$SDT_MM)
+afsnt_dly$SDT_DD <- as.factor(afsnt_dly$SDT_DD)
+afsnt_dly$HOUR <- as.factor(afsnt_dly$HOUR)
+
+# 예측률을 높이기 위하여 미지연과 지연 비율을 73:27로 맞춰서 학습데이터 적합 
+# 같은 결과를 얻기 위해 seed를 설정합니다. 
+set.seed(seed = 123)
+
+# 목적변수 비율 맞춰 샘플링 하기 
+afsnt_Y <- afsnt[(afsnt$DLY == "Y"), ]
+afsnt_N <- afsnt[(afsnt$DLY == "N"), ]
+
+# 트레인 테스트 셋 샘플링하기 위해 다음과 같이 처리합니다. 
+index <- sample(x = 1:2, 
+                size = nrow(x = afsnt_N), 
+                prob = c(0.7, 0.3), 
+                replace = TRUE) 
+
+trainSet_N <- afsnt_N[index == 2,]
+
+index <- sample(x = 1:2, 
+                size = nrow(x = afsnt_Y), 
+                prob = c(0.8, 0.2), 
+                replace = TRUE) 
+
+trainSet_Y <- afsnt_Y[index == 1,]
+trainSet <- rbind(trainSet_Y, trainSet_N)
+
+# 테스트 데이터 셋은 실제 미지연과 지연 데이터 비율인 87:13에 맞춰 적합
+testSet_N <- afsnt_N[index == 1,]
+testSet_N <- sample_n(testSet_N, 160000)
+
+testSet_Y <- afsnt_Y[index == 2, ]
+
+
+testSet <- rbind(testSet_Y, testSet_N)
+
+# 훈련용, 시험용 데이터셋의 목표변수 비중을 확인합니다.  
+trainSet$DLY %>% table() %>% prop.table()
+testSet$DLY %>% table() %>% prop.table()
+
+# 랜덤 포레스트 분류모형 성능 확인하기 위해 ntree = 50, mtry = 5를 임의로 넣어 모델 적합
+fitRFC <- randomForest(x = trainSet[, -8], 
+                       y = trainSet[, 8], 
+                       xtest = testSet[, -8], 
+                       ytest = testSet[, 8], 
+                       ntree = 50, 
+                       mtry = 5, 
+                       importance = TRUE, 
+                       do.trace = 50, 
+                       keep.forest = TRUE)
+
+
+# 모형 적합 결과를 확인합니다. 
+print(x = fitRFC)
+
+# OOB 에러 추정값을 그래프로 그립니다. 
+plot(x = fitRFC$err.rate[, 1], 
+     ylab = 'OOB Error', 
+     type = 'l')
+
+# 변수의 중요도를 그래프로 출력합니다. 내림차순으로 정렬되어 출력되므로 한 눈에 파악됩니다.
+varImpPlot(x = fitRFC, main = 'Random Forest Classification Model with afsnt Dataset')
+
+# 분류모형의 ROC 커브 및 AUROC를 반환하는 사용자 정의 함수를 생성합니다. 
+getROC <- function(real, pred) {
+  
+  
+  # pred와 real이 범주형일 수 있으므로 숫자형 벡터로 변환합니다. 
+  pred <- pred %>% as.numeric()
+  real <- real %>% as.numeric()
+  
+  # ROC 커브를 그리기 위해 prediction object를 생성합니다. 
+  # pred와 real이 범주형일 수 있으므로 숫자형 벡터로 변환합니다. 
+  predObj <- prediction(predictions = pred, 
+                        labels = real)
+  
+  # predObj 객체를 활용하여 performance 객체를 생성합니다. 
+  perform <- performance(prediction.obj = predObj, 
+                         measure = 'tpr', 
+                         x.measure = 'fpr')
+  
+  # ROC 커브를 그립니다. 
+  plot(x = perform, main = 'ROC curve')
+  
+  # 편의상 왼쪽 아래 모서리에서 오른쪽 위 모서리를 잇는 대각선을 추가합니다. 
+  lines(x = c(0, 1), y = c(0, 1), col = 'red', lty = 2)
+  
+  
+  # AUROC를 계산합니다. 
+  auroc <- auc(real, pred)
+  print(x = auroc)
+  
+  # AUROC를 ROC 그래프 오른쪽 아래에 추가합니다. 
+  text(x = 0.9, y = 0, labels = str_c('AUROC : ', auroc), col = 'red', font = 2)
+  
+}
+
+# 최종 모델 성능(f1, 레이블 auroc, 추정확률 auroc) 확인
+# testSet의 추정확률과 추정값(레이블)을 trProb, trPred에 할당합니다. 
+trProb <- fitRFC$test$votes[, 2]
+trPred <- fitRFC$test$predicted
+
+# 시험셋의 실제값을 trReal에 할당합니다. 
+trReal <- testSet$DLY
+
+
+# 혼동행렬을 출력합니다. 
+confusionMatrix(data = trPred, reference = trReal, positive = 'Y')
+
+# F1 점수를 확인합니다.
+F1_Score(y_pred = trPred, y_true = trReal, positive = 'Y')
+
+# 추정레이블로 ROC 그래프를 그리고 AUROC를 확인합니다. 
+getROC(real = trReal, pred = trPred)
+
+# 추정확률로 ROC 그래프를 그리고 AUROC를 확인합니다. 
+getROC(real = trReal, pred = trProb)
+
+
+# 최종 afsnt_dly를 예측할 학습셋 적합
+#위와 마찬가지로 미지연과 지연의 비율을 73:27로 맞춰 학습셋 적합
+afsnt_Y <- afsnt[(afsnt$DLY == "Y"), ]
+afsnt_N <- afsnt[(afsnt$DLY == "N"), ]
+
+# 존재하는 지연 데이터 개수에 맞는 미지연 데이터(32150행) 추출 후 바인딩
+trainSet_N <- sample_n(afsnt_N, 321560)
+trainSet <- rbind(afsnt_Y, trainSet_N)
+afsnt_dly <- afsnt_dly[c(colnames(trainSet))]
+
+# 랜덤 포레스트 분류모형을 적합합니다. (그리드 서칭 결과 최적의 ntree, mtry 결정)
+# 다른 범주가 존재하는 'FLO' 변수 제거
+fitRFC <- randomForest(x = trainSet[, -c(6,8)], 
+                       y = trainSet[, 8], 
+                       xtest = afsnt_dly[, -c(6,8)], 
+                       ntree = 500, 
+                       mtry = 5, 
+                       importance = TRUE, 
+                       do.trace = 50, 
+                       keep.forest = TRUE)
+
+trProb <- fitRFC$test$votes[, 2]
+trPred <- fitRFC$test$predicted
+
+final <- cbind(trPred, trProb) %>% as.data.frame()
+colnames(final) <- c("DLY", "DLY_RATE")
+final$DLY <- as.factor(final$DLY)
+final$DLY = revalue(final$DLY, replace=c("1"="N", "2"="Y"))
+
+# 기존 afsnt_dly에 예측한 DLY, DLY_RATE 컬럼 추가
+afsnt_dly_final <- cbind(afsnt_dly, final)
+
+write.csv(afsnt_dly_final, file = "afsnt_dly_final.csv", row.names = FALSE)
+head(afsnt_dly_final)
+
+
+
+
+
+
+
+
+
+
+
